@@ -47,6 +47,7 @@
 #include <linux/dax.h>
 #include <linux/uaccess.h>
 #include <linux/rseq.h>
+#include <linux/xattr.h>
 #include <asm/param.h>
 #include <asm/page.h>
 
@@ -829,6 +830,72 @@ static int parse_elf_properties(struct file *f, const struct elf_phdr *phdr,
 	return ret == -ENOENT ? 0 : ret;
 }
 
+#ifdef CONFIG_OPENPAX
+#ifdef CONFIG_OPENPAX_XATTR_PAX_FLAGS
+static int openpax_parse_xattr_flags(struct file * const file)
+{
+	ssize_t xattr_size, i;
+	unsigned char xattr_value[sizeof("pemrs") - 1];
+
+	xattr_size = pax_getxattr(file, xattr_value, sizeof xattr_value);
+	if (xattr_size < 0 || xattr_size > sizeof xattr_value)
+		return -ENOENT;
+
+	for (i = 0; i < xattr_size; i++)
+		switch (xattr_value[i]) {
+		default:
+			return -EINVAL;
+
+#define parse_flag(option_disable, option_enable, flag)				\
+		case option_disable:						\
+			clear_bit(flag, &current->mm->pax_flags);		\
+			break;							\
+		case option_enable:						\
+			set_bit(flag, &current->mm->pax_flags);			\
+			break;
+
+		parse_flag('p', 'P', PAXF_PAGEEXEC);
+		parse_flag('e', 'E', PAXF_EMUTRAMP);
+		parse_flag('m', 'M', PAXF_MPROTECT);
+		parse_flag('r', 'R', PAXF_RANDMMAP);
+		parse_flag('s', 'S', PAXF_SEGMEXEC);
+#undef parse_flag
+		}
+
+	return 0;
+}
+#endif
+
+static int openpax_set_flags(struct file * const file, const int snapshot_randomize_va_space)
+{
+#ifdef CONFIG_OPENPAX_XATTR_PAX_FLAGS
+	int error;
+#endif
+	current->mm->pax_flags = 0;
+
+	if (snapshot_randomize_va_space) {
+		set_bit(PAXF_RANDMMAP, &current->mm->pax_flags);
+	}
+
+	if (!pax_softmode) {
+		set_bit(PAXF_PAGEEXEC, &current->mm->pax_flags);
+		set_bit(PAXF_MPROTECT, &current->mm->pax_flags);
+	}
+
+#ifdef CONFIG_OPENPAX_EMUTRAMP_DEFAULT
+	set_bit(PAXF_EMUTRAMP, &current->mm->pax_flags);
+#endif
+
+#ifdef CONFIG_OPENPAX_XATTR_PAX_FLAGS
+	error = openpax_parse_xattr_flags(file);
+	if (error != -ENOENT)
+		return error;
+#endif
+
+	return 0;
+}
+#endif
+
 static int load_elf_binary(struct linux_binprm *bprm)
 {
 	struct file *interpreter = NULL; /* to shut gcc up */
@@ -1014,11 +1081,28 @@ out_free_interp:
 	/* Do this immediately, since STACK_TOP as used in setup_arg_pages
 	   may depend on the personality.  */
 	SET_PERSONALITY2(*elf_ex, &arch_state);
+
+	const int snapshot_randomize_va_space = READ_ONCE(randomize_va_space);
+
+#ifdef CONFIG_OPENPAX
+	retval = openpax_set_flags(bprm->file, snapshot_randomize_va_space);
+	if (retval)
+		goto out_free_dentry;
+
+	if (test_bit(PAXF_PAGEEXEC, &current->mm->pax_flags) || test_bit(PAXF_SEGMEXEC, &current->mm->pax_flags)) {
+		executable_stack = EXSTACK_DISABLE_X;
+		current->personality &= ~READ_IMPLIES_EXEC;
+	} else
+#endif
+
 	if (elf_read_implies_exec(*elf_ex, executable_stack))
 		current->personality |= READ_IMPLIES_EXEC;
 
-	const int snapshot_randomize_va_space = READ_ONCE(randomize_va_space);
-	if (!(current->personality & ADDR_NO_RANDOMIZE) && snapshot_randomize_va_space)
+	if (!(current->personality & ADDR_NO_RANDOMIZE) && snapshot_randomize_va_space
+#ifdef CONFIG_OPENPAX
+	    && test_bit(PAXF_RANDMMAP, &current->mm->pax_flags)
+#endif
+	    )
 		current->flags |= PF_RANDOMIZE;
 
 	setup_new_exec(bprm);
